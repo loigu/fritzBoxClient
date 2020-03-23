@@ -17,4 +17,11 @@
       </plugin>
     </plugins>
   </build>
+  <distributionManagement>
+   <repository>
+     <id>github</id>
+     <name>GitHub OWNER Apache Maven Packages</name>
+     <url>https://maven.pkg.github.com/loigu/fritzBoxClient</url>
+   </repository>
+</distributionManagement>
 </project>
