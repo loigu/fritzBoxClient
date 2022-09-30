@@ -6,8 +6,7 @@ import java.net.http.HttpResponse;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Optional;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
@@ -15,6 +14,12 @@ import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathExpressionException;
 import javax.xml.xpath.XPathFactory;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 import org.sasanarakkha.FritzBoxCommunicator.HttpException;
 import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
@@ -38,42 +43,58 @@ public class FritzBoxClient {
 	 * generic data interface url. for getting ticket list "page" use params xhr=1
 	 * lang=en page=kidPro sid=${SID}
 	 */
-	private static String ticketGetUrl = "/data.lua";
+	private static String dataUrl = "/data.lua";
+	
+	/**
+	 * url for changing device setting
+	 */
+	private static String changeDeviceUrl = "/net/edit_device.lua";
 
 	private FritzBoxCommunicator communicator;
 
 	private String username, password;
 	private String sid;
 
-	class FritzBoxException extends Exception {
+	public class FritzBoxException extends Exception {
 		private static final long serialVersionUID = 5605971011660206227L;
 
-		public FritzBoxException(String string) {
-			super(string);
+		public FritzBoxException(String message) {
+			super(message);
 		}
 
-		public FritzBoxException(String string, Throwable cause) {
-			super(string, cause);
+		public FritzBoxException(String message, Throwable cause) {
+			super(message, cause);
 		}
 	}
 
-	class AuthenticationException extends FritzBoxException {
+	public class AuthenticationException extends FritzBoxException {
 		private static final long serialVersionUID = 2029949672590455025L;
 
-		public AuthenticationException(String str, Throwable e) {
-			super(str, e);
+		public AuthenticationException(String message, Throwable e) {
+			super(message, e);
 		}
 
-		public AuthenticationException(String string) {
-			super(string);
+		public AuthenticationException(String message) {
+			super(message);
 		}
 	}
 
-	class InvalidTicketException extends FritzBoxException {
+	public class InvalidTicketException extends FritzBoxException {
 		private static final long serialVersionUID = 4786555000843723640L;
 
-		public InvalidTicketException(String string) {
-			super(string);
+		public InvalidTicketException(String message) {
+			super(message);
+		}
+
+	}
+	
+
+	public class DeviceInactiveException extends FritzBoxException {
+
+		private static final long serialVersionUID = 6410571346795351048L;
+
+		public DeviceInactiveException(String message) {
+			super(message);
 		}
 
 	}
@@ -156,43 +177,19 @@ public class FritzBoxClient {
 		this.sid = null;
 	}
 
-	/*
-	 * NOTE: xml parser is unable to parse the result, get the table by regex ...
-	 * <table
-	 * id="uiTickets"><tr><td>113265</td><td>849441</td><td>029965</td><td>990786</
-	 * td><td>399360</td></tr><tr><td>208531</td><td>242994</td><td>839139</td><td>
-	 * 996254</td><td>170741</td></tr></table> ...
-	 */
-	private static final Pattern ticketTablePattern = Pattern.compile("<table id=\"uiTickets\">.*</table>");
 
-	protected List<String> parseTicketTableResponse(String body) throws FritzBoxException, IOException {
-		Matcher m = ticketTablePattern.matcher(body);
 
-		if (!m.find()) {
-			throw new FritzBoxException("malformed response, no ticket table found:\n" + body);
-		}
-
-		NodeList tickets = getElements(m.group(), "/table/tr/td");
-
-		List<String> result = new ArrayList<String>(10);
-		for (int i = 0; i < tickets.getLength(); i++) {
-			result.add(tickets.item(i).getTextContent());
-		}
-
-		return result;
-	}
 
 	/**
 	 * get list of active tickets for fritzBox. client must be logged in first
 	 * 
-	 * @throws HttpException
 	 */
 	public List<String> getTickets() throws IOException, InterruptedException, FritzBoxException, HttpException {
 		if (sid == null) {
 			throw new FritzBoxException("not logged in");
 		}
 
-		HttpResponse<String> response = communicator.sendPost(FritzBoxClient.ticketGetUrl, "page=kidPro&sid=" + sid);
+		HttpResponse<String> response = communicator.sendPost(FritzBoxClient.dataUrl, "page=kidPro&sid=" + sid);
 
 		return parseTicketTableResponse(response.body());
 	}
@@ -213,7 +210,210 @@ public class FritzBoxClient {
 		 * success: The ticket was successfully redeemed.
 		 */
 		if (response.body().indexOf("The ticket was successfully redeemed") == -1) {
-			throw new InvalidTicketException("Rendeeming ticket failed");
+			throw new InvalidTicketException("Rendeeming ticket failed:\n" + response.body());
 		}
+		
 	}
+	
+	/**
+	 * get fritzbox info of an active device (connected to hotspot)
+	 * @throws DeviceInactiveException 
+	 * 
+	 */
+	public Optional<Device> getActiveDeviceInfo(String ipAddress) 
+			throws HttpException, IOException, InterruptedException, DeviceInactiveException {
+		
+		Optional<Device> device = Optional.empty();
+		
+		String params = new StringBuilder("xhr=1")
+				.append("&sid=" + this.sid)
+				.append("&lang=en")
+				.append("&page=netDev")
+				.append("&xhrId=all")
+				.append("&no_sidrenew=")
+				.toString();		
+		
+		HttpResponse<String> response = communicator.sendPost(FritzBoxClient.dataUrl, params);	
+		
+	    JSONObject jsonObject = new JSONObject(response.body());
+	    JSONObject data = jsonObject.getJSONObject("data");
+	    JSONArray actives = data.getJSONArray("active");
+	    
+		for (int i = 0; i < actives.length(); i++) {
+			JSONObject active = actives.getJSONObject(i);
+			if (active.getString("ipv4").equalsIgnoreCase(ipAddress)) {
+
+				Device dev = new Device(active.getString("name"), active.getString("ipv4"), active.getString("UID"));
+				device = Optional.of(dev);
+				break;
+			}
+		}
+	    
+	    if (device.isEmpty()) {
+	    	throw new DeviceInactiveException("This device is inactive in Fritzbox. Probably has problem with your network connection.");	
+	    }
+	    
+	    
+	    //get device profile
+		params = new StringBuilder("xhr=1")
+				.append("&sid=" + this.sid)
+				.append("&lang=en")
+				.append("&no_sidrenew=")
+				.append("&oldpage=net/edit_device.lua")
+				.append("&back_to_pid=")
+				.append("&dev=" + device.get().getUID())
+				.append("&initalRefreshParamsSaved=true")
+				.toString();		
+		
+		response = communicator.sendPost(FritzBoxClient.dataUrl, params);	
+		
+	    Document doc = Jsoup.parse(response.body());
+	    Elements select =  doc.getElementsByAttributeValue("name", "kisi_profile");
+	    if (select == null) {
+			return Optional.empty();    	
+	    }	 
+	    
+	    
+	    Optional<AccessProfile> profile = Optional.empty();
+	    
+	    Elements options = select.get(0).children();
+	    for (Element option : options) {
+	        if (option.hasAttr("selected")) {
+	            profile = AccessProfile.create(option.val());
+	            break;
+	        }
+	    }
+	    
+	    
+	    if (profile.isPresent()) {
+		    device.get().setProfile(profile.get());
+	    }
+	    
+	    
+	    return device;
+	}
+	
+	
+	
+	
+	/**
+	 * change profile setting of an active device 
+	 * 
+	 */
+//	public Optional<Device> changeActiveDevice(String ipAddress, AccessProfile profile) 
+//			throws HttpException, IOException, InterruptedException, FritzBoxException, DeviceInactiveException {
+//		
+//		Optional<Device> device = this.getActiveDeviceInfo(ipAddress);
+//		if (device.isEmpty()) {
+//	    	throw new DeviceInactiveException("This device is inactive in Fritzbox. Probably has problem with your network connection.");		
+//		}
+//		
+//		this.changeDevice(ipAddress, profile, device.get().getName(), device.get().getUID());
+//		
+//		return device;		
+//	}
+//	
+	
+	
+	/**
+	 * change settings of a device 
+	 * 
+	 */		
+	public void changeDevice(Device device) 
+			throws HttpException, IOException, InterruptedException, FritzBoxException {
+		this.changeDevice(device.getIpAddress(), device.getProfile(), device.getName(), device.getUID());
+	}	
+	
+
+	
+	
+	/**
+	 * change settings of a device 
+	 * 
+	 */	
+	protected void changeDevice(String ipAddress, AccessProfile profile, String deviceName, String UID) 
+			throws HttpException, IOException, InterruptedException, FritzBoxException {
+		
+		String params = new StringBuilder("sid=" + this.sid)
+				.append("&plc_desc=" + deviceName)
+				.append("&dev_name=" + deviceName)
+				.append("&btn_reset_name=")
+				.append("&dev_ip=" + ipAddress)
+				.append("&static_dhcp=on")
+				.append("&kisi_profile=" + profile.getName())
+				.append("&back_to_page=%2Fnet%2Fnet_overview.lua")
+				.append("&dev=" + UID)
+				.append("&last_action=")
+				.append("&validate=btn_save&xhr=1&useajax=1")
+				.toString();
+		
+		HttpResponse<String> response = communicator.sendPost(FritzBoxClient.changeDeviceUrl, params);
+		
+	    if (! response.body().equalsIgnoreCase("{\"tomark\":[],\"validate\":\"btn_save\",\"result\":\"ok\",\"ok\":true}")) {
+	    	throw new FritzBoxException("malformed response, unable to change device:\n" + response.body());
+	    }
+	    
+		params = new StringBuilder("xhr=1")
+				.append("&sid=" + this.sid)
+				.append("&lang=en")
+				.append("&no_sidrenew=")
+				.append("&plc_desc=" + deviceName)
+				.append("&dev_name=" + deviceName)
+				.append("&dev_ip=" + ipAddress)
+				.append("&static_dhcp=on")
+				.append("&kisi_profile=" + profile.getName())
+				.append("&back_to_page=%2Fnet%2Fnet_overview.lua")
+				.append("&dev=" + UID)	
+				.append("&last_action=")
+				.append("&btn_save=&oldpage=%2Fnet%2Fedit_device.lua")
+				.toString();
+			    
+		response = communicator.sendPost(FritzBoxClient.dataUrl, params);
+		
+	    if (! response.body().equalsIgnoreCase("{\"pid\":\"netDev\"}")) {
+	    	throw new FritzBoxException("malformed response, change device failed:\n" + response.body());	    	
+	    }
+	    
+	}
+	
+	
+	
+	/**
+	 * convert ticket response to list of ticket numbers
+	 * 
+	 */
+	protected List<String> parseTicketTableResponse(String body) throws FritzBoxException, IOException {
+		/*
+		 * <table
+		 * id="uiTickets"><tr><td>113265</td><td>849441</td><td>029965</td><td>990786</
+		 * td><td>399360</td></tr><tr><td>208531</td><td>242994</td><td>839139</td><td>
+		 * 996254</td><td>170741</td></tr></table> ...
+		 */
+		
+		
+		List<String> result = new ArrayList<String>();
+		
+	    Document doc = Jsoup.parse(body);
+	    
+	    Element table =  doc.getElementById("uiTickets");
+	    if (table == null) {
+			throw new FritzBoxException("malformed response, no ticket table found:\n" + body);	    	
+	    }
+	    
+        for (Element row : table.select("tr")) {
+            Elements tds = row.select("td");
+            for (Element td : tds) {
+            	result.add(td.text());
+            }
+        }
+        
+	    if (result.size() != 10) {
+			throw new FritzBoxException("malformed response, ticket numbers count:\n" + result.size());	    	
+	    }        
+        
+		return result;
+	}
+
+
+	
 }
